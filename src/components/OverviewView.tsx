@@ -17,6 +17,7 @@ import {
   UserProfile,
 } from '../types';
 import { detectOverlaps } from '../utils/fairness';
+import { WeeklySummaryCard } from './WeeklySummaryCard';
 
 interface OverviewViewProps {
   profile: UserProfile;
@@ -141,6 +142,14 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Current Week Summary Card with Progress Bar */}
+      <WeeklySummaryCard
+        profile={profile}
+        shifts={shifts}
+        staffDirectory={staffDirectory}
+        onNavigateToSchedule={() => onNavigate('schedule')}
+      />
 
       {/* Main Split Content */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">

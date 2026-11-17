@@ -7,6 +7,9 @@ import {
   TimeOffRequest,
 } from '../types';
 
+export const WORKDAY_START_TIME = '08:00';
+export const WORKDAY_END_TIME = '22:00';
+
 export function parseTimeToMinutes(timeStr: string): number {
   const [hStr, mStr] = timeStr.split(':');
   const h = Number(hStr);
@@ -16,14 +19,14 @@ export function parseTimeToMinutes(timeStr: string): number {
 }
 
 export function minutesToTimeStr(totalMinutes: number): string {
-  const normalized = ((totalMinutes % 1440) + 1440) % 1440;
-  const h = Math.floor(normalized / 60);
-  const m = normalized % 60;
+  const clamped = Math.max(0, Math.min(24 * 60 - 1, Math.round(totalMinutes)));
+  const h = Math.floor(clamped / 60);
+  const m = clamped % 60;
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
 export function computeDurationHours(startTime: string, endTime: string, breakMinutes = 0): number {
-  let start = parseTimeToMinutes(startTime);
+  const start = parseTimeToMinutes(startTime);
   let end = parseTimeToMinutes(endTime);
   if (end <= start) {
     end += 24 * 60;
@@ -136,9 +139,17 @@ export interface DetectedOverlapSummary {
   totalOverlappingShifts: number;
 }
 
+/**
+ * Enforces "only 1 worker every time, no time overlap":
+ * detects any concurrent overlapping active shifts on the same date across ALL departments.
+ */
 export function detectOverlaps(shifts: Shift[]): DetectedOverlapSummary {
-  const activeShifts = shifts.filter((s) => s.status !== 'completed' && s.status !== 'open' && Boolean(s.assignedUid));
-  const multiCandidateShifts = activeShifts.filter((s) => s.candidateUids.length > 1 || s.status === 'conflict');
+  const activeShifts = shifts.filter(
+    (s) => s.status !== 'completed' && s.status !== 'open' && Boolean(s.assignedUid)
+  );
+  const multiCandidateShifts = activeShifts.filter(
+    (s) => s.candidateUids.length > 1 || s.status === 'conflict'
+  );
 
   const visited = new Set<string>();
   const concurrentShiftGroups: Shift[][] = [];
@@ -150,11 +161,7 @@ export function detectOverlaps(shifts: Shift[]): DetectedOverlapSummary {
     const group: Shift[] = [a];
     for (let j = i + 1; j < activeShifts.length; j++) {
       const b = activeShifts[j];
-      if (
-        a.date === b.date &&
-        a.department === b.department &&
-        timesOverlap(a.startTime, a.endTime, b.startTime, b.endTime)
-      ) {
+      if (a.date === b.date && timesOverlap(a.startTime, a.endTime, b.startTime, b.endTime)) {
         group.push(b);
       }
     }
@@ -179,7 +186,7 @@ export function detectOverlaps(shifts: Shift[]): DetectedOverlapSummary {
 /**
  * Generates an actionable Fairness Arrangement Plan for all shifts that have
  * multiple people scheduled for the same time (either via candidateUids > 1
- * or concurrent overlapping shifts in the same date + department).
+ * or concurrent overlapping shifts on the same date).
  */
 export function buildFairnessArrangementPlan(
   shifts: Shift[],
@@ -195,7 +202,62 @@ export function buildFairnessArrangementPlan(
     .filter((s) => s.status !== 'completed' && s.status !== 'open' && Boolean(s.assignedUid))
     .sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
 
-  // 1. Resolve concurrent overlapping shifts in the same date + department
+  // Track occupied intervals per date across the whole workplace (only 1 worker at any time)
+  const occupiedByDate = new Map<string, Array<{ shiftId: string; startMin: number; endMin: number }>>();
+  for (const s of activeShifts) {
+    const startMin = parseTimeToMinutes(s.startTime);
+    let endMin = parseTimeToMinutes(s.endTime);
+    if (endMin <= startMin) endMin += 1440;
+    const arr = occupiedByDate.get(s.date) || [];
+    arr.push({ shiftId: s.id, startMin, endMin });
+    occupiedByDate.set(s.date, arr);
+  }
+
+  const findNextAvailableSlot = (
+    initialDate: string,
+    preferredStartMin: number,
+    durationMin: number,
+    ignoreShiftId: string
+  ): { date: string; startMin: number; endMin: number } => {
+    let checkDate = initialDate;
+    let cursorMin = preferredStartMin;
+    const endOfDayMin = parseTimeToMinutes(WORKDAY_END_TIME);
+    const startOfDayMin = parseTimeToMinutes(WORKDAY_START_TIME);
+
+    for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
+      const existing = (occupiedByDate.get(checkDate) || [])
+        .filter((iv) => iv.shiftId !== ignoreShiftId)
+        .sort((a, b) => a.startMin - b.startMin);
+
+      let candidateStart = Math.max(startOfDayMin, cursorMin);
+      for (const iv of existing) {
+        if (candidateStart < iv.endMin && candidateStart + durationMin > iv.startMin) {
+          candidateStart = iv.endMin;
+        }
+      }
+
+      if (candidateStart + durationMin <= endOfDayMin) {
+        return {
+          date: checkDate,
+          startMin: candidateStart,
+          endMin: candidateStart + durationMin,
+        };
+      }
+
+      const d = new Date(`${checkDate}T12:00:00Z`);
+      d.setUTCDate(d.getUTCDate() + 1);
+      checkDate = d.toISOString().slice(0, 10);
+      cursorMin = startOfDayMin;
+    }
+
+    return {
+      date: checkDate,
+      startMin: startOfDayMin,
+      endMin: startOfDayMin + durationMin,
+    };
+  };
+
+  // 1. Resolve concurrent overlapping shifts on the same date (only 1 worker at any time)
   for (let i = 0; i < activeShifts.length; i++) {
     const anchor = activeShifts[i];
     if (handledShiftIds.has(anchor.id)) continue;
@@ -204,13 +266,11 @@ export function buildFairnessArrangementPlan(
       (s) =>
         !handledShiftIds.has(s.id) &&
         s.date === anchor.date &&
-        s.department === anchor.department &&
         timesOverlap(anchor.startTime, anchor.endTime, s.startTime, s.endTime)
     );
 
     if (overlapping.length <= 1) continue;
 
-    // Collect all competing UIDs across these overlapping shifts
     const competingUidSet = new Set<string>();
     overlapping.forEach((s) => {
       if (s.assignedUid) competingUidSet.add(s.assignedUid);
@@ -232,7 +292,6 @@ export function buildFairnessArrangementPlan(
       .filter((m): m is StaffFairnessMetric => Boolean(m))
       .map((m) => `${m.displayName} (${m.effectiveTotalHours.toFixed(1)}h/${m.weeklyHoursTarget}h)`);
 
-    // Assign primary shift to the fairest candidate
     resolutions.push({
       shiftId: primaryShift.id,
       shiftTitle: primaryShift.title,
@@ -246,48 +305,39 @@ export function buildFairnessArrangementPlan(
       selectedAssigneeName: fairest.displayName,
       competingNames: competingSummary,
       action: 'assign_fairest',
-      reason: `Fairness selected ${fairest.displayName} (${fairest.effectiveTotalHours.toFixed(1)}h / ${fairest.weeklyHoursTarget}h = ${Math.round(fairest.utilizationRatio * 100)}%) over higher-hour overlap candidates.`,
+      reason: `Fairness selected ${fairest.displayName} (${fairest.effectiveTotalHours.toFixed(1)}h / ${fairest.weeklyHoursTarget}h = ${Math.round(fairest.utilizationRatio * 100)}%) so only 1 worker covers this window.`,
     });
 
-    // Update running hours for the winner so subsequent slots stay balanced
     fairest.effectiveTotalHours = Math.round((fairest.effectiveTotalHours + primaryShift.durationHours) * 100) / 100;
     fairest.utilizationRatio = Math.round((fairest.effectiveTotalHours / fairest.weeklyHoursTarget) * 1000) / 1000;
     handledShiftIds.add(primaryShift.id);
 
-    // Rebalance secondary overlapping shifts to a non-overlapping later slot or next day + fairest remaining person
+    // Move secondary overlapping shifts to non-overlapping later gap or next day
     for (let k = 1; k < overlapping.length; k++) {
       const sec = overlapping[k];
       handledShiftIds.add(sec.id);
 
-      // Move secondary shift sequentially right after primary shift (or next non-overlapping block)
       const primaryEndMin = parseTimeToMinutes(primaryShift.endTime);
       const secDurationMin = Math.round(sec.durationHours * 60);
-      let newDate = sec.date;
-      let newStartMin = primaryEndMin;
-      let newEndMin = primaryEndMin + secDurationMin;
+      const slot = findNextAvailableSlot(sec.date, primaryEndMin, secDurationMin, sec.id);
 
-      if (newEndMin > 22 * 60) {
-        // Shift to next day morning 08:00 to avoid overnight conflict
-        const d = new Date(`${sec.date}T12:00:00Z`);
-        d.setUTCDate(d.getUTCDate() + 1);
-        newDate = d.toISOString().slice(0, 10);
-        newStartMin = 8 * 60;
-        newEndMin = 8 * 60 + secDurationMin;
-      }
+      const dateList = (occupiedByDate.get(slot.date) || []).filter((iv) => iv.shiftId !== sec.id);
+      dateList.push({ shiftId: sec.id, startMin: slot.startMin, endMin: slot.endMin });
+      occupiedByDate.set(slot.date, dateList);
 
       const remainingCandidates = allCompeting.filter((uid) => uid !== fairest.uid);
       const nextPerson =
         selectFairestCandidate(
           remainingCandidates.length > 0 ? remainingCandidates : allCompeting,
           metricsMap,
-          { date: newDate, timeOffRequests }
+          { date: slot.date, timeOffRequests }
         ) ||
-        selectFairestCandidate(allCompeting, metricsMap, { date: newDate, timeOffRequests });
+        selectFairestCandidate(allCompeting, metricsMap, { date: slot.date, timeOffRequests });
 
       if (!nextPerson) continue;
 
-      const newStartTime = minutesToTimeStr(newStartMin);
-      const newEndTime = minutesToTimeStr(newEndMin);
+      const newStartTime = minutesToTimeStr(slot.startMin);
+      const newEndTime = minutesToTimeStr(slot.endMin);
 
       resolutions.push({
         shiftId: sec.id,
@@ -302,10 +352,10 @@ export function buildFairnessArrangementPlan(
         selectedAssigneeName: nextPerson.displayName,
         competingNames: competingSummary,
         action: 'rebalance_secondary',
-        newDate,
+        newDate: slot.date,
         newStartTime,
         newEndTime,
-        reason: `Overlap cleared: moved to ${newDate} ${newStartTime}-${newEndTime} and assigned to ${nextPerson.displayName} (${nextPerson.effectiveTotalHours.toFixed(1)}h/${nextPerson.weeklyHoursTarget}h).`,
+        reason: `Overlap cleared: moved to ${slot.date} ${newStartTime}-${newEndTime} and assigned to ${nextPerson.displayName} (${nextPerson.effectiveTotalHours.toFixed(1)}h/${nextPerson.weeklyHoursTarget}h).`,
       });
 
       nextPerson.effectiveTotalHours = Math.round((nextPerson.effectiveTotalHours + sec.durationHours) * 100) / 100;
@@ -374,6 +424,9 @@ export interface GeneratedWeeklyShiftDraft {
   fairnessNote: string;
 }
 
+/**
+ * Default non-overlapping daily shift templates spanning the 08:00–22:00 operating day.
+ */
 export const DEFAULT_WEEKLY_TEMPLATES: WeeklySlotTemplate[] = [
   {
     title: 'Morning Operations Shift',
@@ -381,13 +434,6 @@ export const DEFAULT_WEEKLY_TEMPLATES: WeeklySlotTemplate[] = [
     startTime: '08:00',
     endTime: '16:00',
     includeWeekends: true,
-  },
-  {
-    title: 'Afternoon Support Desk',
-    department: 'Support Desk',
-    startTime: '12:00',
-    endTime: '20:00',
-    includeWeekends: false,
   },
   {
     title: 'Evening Operations Coverage',
@@ -407,7 +453,7 @@ export function doesSubmissionMatchSlot(
 
   const subDept = sub.department.trim().toLowerCase();
   const slotDept = slot.department.trim().toLowerCase();
-  if (subDept !== 'any' && subDept !== slotDept) {
+  if (subDept !== 'any' && slotDept !== 'any' && subDept !== slotDept) {
     return false;
   }
 
@@ -422,10 +468,204 @@ export function doesSubmissionMatchSlot(
   return subStart <= slotStart && subEnd >= slotEnd;
 }
 
+export interface DayOpenGapInterval {
+  date: string;
+  startTime: string;
+  endTime: string;
+  durationHours: number;
+}
+
+export interface DayPartitionResult {
+  assignedShifts: Shift[];
+  openGaps: DayOpenGapInterval[];
+  matchingOpenShifts: Map<string, Shift>; // key = `${startTime}-${endTime}`
+  staleOpenShiftIds: string[];
+}
+
+/**
+ * Dynamically splits a single day's operating timeline into non-overlapping blocks:
+ * - If no one has an assigned shift on that date -> 1 single full-day open block (08:00–22:00).
+ * - If 1 or more assigned shifts exist on that date -> keeps the assigned shift(s) and fills
+ *   only the non-overlapping uncovered gap intervals before/between/after them.
+ */
+export function partitionDayTimeline(
+  date: string,
+  dayShifts: Shift[],
+  dayStartTime = WORKDAY_START_TIME,
+  dayEndTime = WORKDAY_END_TIME
+): DayPartitionResult {
+  const assignedRaw = dayShifts
+    .filter((s) => s.status !== 'open' && Boolean(s.assignedUid))
+    .sort(
+      (a, b) =>
+        parseTimeToMinutes(a.startTime) - parseTimeToMinutes(b.startTime) ||
+        a.id.localeCompare(b.id)
+    );
+
+  const openShiftsRaw = dayShifts.filter(
+    (s) => s.status === 'open' || !s.assignedUid
+  );
+
+  // Merge/sort assigned intervals to compute exact uncovered non-overlapping gaps
+  let horizonStart = parseTimeToMinutes(dayStartTime);
+  let horizonEnd = parseTimeToMinutes(dayEndTime);
+
+  const assignedIntervals = assignedRaw.map((s) => {
+    const startMin = parseTimeToMinutes(s.startTime);
+    let endMin = parseTimeToMinutes(s.endTime);
+    if (endMin <= startMin) endMin += 1440;
+    if (startMin < horizonStart) horizonStart = startMin;
+    if (endMin > horizonEnd) horizonEnd = Math.min(24 * 60 - 1, endMin);
+    return { startMin, endMin };
+  });
+
+  const openGaps: DayOpenGapInterval[] = [];
+
+  if (assignedIntervals.length === 0) {
+    // Nobody got a shift on this day -> ONE full-day column/slot
+    openGaps.push({
+      date,
+      startTime: minutesToTimeStr(horizonStart),
+      endTime: minutesToTimeStr(horizonEnd),
+      durationHours: computeDurationHours(
+        minutesToTimeStr(horizonStart),
+        minutesToTimeStr(horizonEnd),
+        0
+      ),
+    });
+  } else {
+    let cursor = horizonStart;
+    for (const iv of assignedIntervals) {
+      if (iv.startMin - cursor >= 30) {
+        const sTime = minutesToTimeStr(cursor);
+        const eTime = minutesToTimeStr(iv.startMin);
+        openGaps.push({
+          date,
+          startTime: sTime,
+          endTime: eTime,
+          durationHours: computeDurationHours(sTime, eTime, 0),
+        });
+      }
+      cursor = Math.max(cursor, iv.endMin);
+    }
+
+    if (horizonEnd - cursor >= 30) {
+      const sTime = minutesToTimeStr(cursor);
+      const eTime = minutesToTimeStr(horizonEnd);
+      openGaps.push({
+        date,
+        startTime: sTime,
+        endTime: eTime,
+        durationHours: computeDurationHours(sTime, eTime, 0),
+      });
+    }
+  }
+
+  // Match existing Firestore 'open' shift docs to the clean non-overlapping gaps
+  const matchingOpenShifts = new Map<string, Shift>();
+  const usedOpenIds = new Set<string>();
+
+  for (const gap of openGaps) {
+    const key = `${gap.startTime}-${gap.endTime}`;
+    const exactMatch = openShiftsRaw.find(
+      (s) =>
+        !usedOpenIds.has(s.id) &&
+        s.startTime === gap.startTime &&
+        s.endTime === gap.endTime
+    );
+    if (exactMatch) {
+      matchingOpenShifts.set(key, exactMatch);
+      usedOpenIds.add(exactMatch.id);
+    }
+  }
+
+  const staleOpenShiftIds = openShiftsRaw
+    .filter((s) => !usedOpenIds.has(s.id))
+    .map((s) => s.id);
+
+  return {
+    assignedShifts: assignedRaw,
+    openGaps,
+    matchingOpenShifts,
+    staleOpenShiftIds,
+  };
+}
+
+export interface WeekReconciliationPlan {
+  staleOpenShiftIds: string[];
+  missingOpenDrafts: GeneratedWeeklyShiftDraft[];
+}
+
+export function buildWeekReconciliationPlan(params: {
+  weekDates: string[];
+  existingShifts: Shift[];
+  dayStartTime?: string;
+  dayEndTime?: string;
+}): WeekReconciliationPlan {
+  const {
+    weekDates,
+    existingShifts,
+    dayStartTime = WORKDAY_START_TIME,
+    dayEndTime = WORKDAY_END_TIME,
+  } = params;
+
+  const staleOpenShiftIds: string[] = [];
+  const missingOpenDrafts: GeneratedWeeklyShiftDraft[] = [];
+
+  for (const date of weekDates) {
+    const dayShifts = existingShifts.filter((s) => s.date === date);
+    const partition = partitionDayTimeline(date, dayShifts, dayStartTime, dayEndTime);
+    staleOpenShiftIds.push(...partition.staleOpenShiftIds);
+
+    for (const gap of partition.openGaps) {
+      const key = `${gap.startTime}-${gap.endTime}`;
+      if (!partition.matchingOpenShifts.has(key)) {
+        const isFullDay =
+          partition.assignedShifts.length === 0 &&
+          gap.startTime === dayStartTime &&
+          gap.endTime === dayEndTime;
+
+        missingOpenDrafts.push({
+          title: isFullDay ? 'Full Day Coverage (Open)' : 'Open Shift Coverage',
+          department: 'Operations',
+          date,
+          startTime: gap.startTime,
+          endTime: gap.endTime,
+          durationHours: gap.durationHours,
+          assignedUid: '',
+          assignedName: '',
+          status: 'open',
+          fairnessNote: isFullDay
+            ? 'Full-day open slot — no staff assigned yet.'
+            : 'Remaining non-overlapping open time slot.',
+        });
+      }
+    }
+  }
+
+  return {
+    staleOpenShiftIds,
+    missingOpenDrafts,
+  };
+}
+
+export function needsScheduleNormalization(
+  weekDates: string[],
+  existingShifts: Shift[]
+): boolean {
+  // Only flag normalization if there are shifts in this week that create overlaps or fragmented open slots
+  const weekSet = new Set(weekDates);
+  const weekShifts = existingShifts.filter((s) => weekSet.has(s.date));
+  if (weekShifts.length === 0) return false;
+
+  const plan = buildWeekReconciliationPlan({ weekDates, existingShifts });
+  return plan.staleOpenShiftIds.length > 0;
+}
+
 /**
  * Matches open/blank shifts against active ShiftSubmissions and produces
- * fairness-based assignment plans ONLY for open shifts that have >= 1 matching submission.
- * Open shifts with zero submissions remain blank.
+ * fairness-based assignment plans ONLY for open shifts that have >= 1 matching submission,
+ * strictly enforcing: 1 worker at any time across the entire day (no time overlap).
  */
 export function buildOpenShiftAssignmentPlan(params: {
   shifts: Shift[];
@@ -443,23 +683,30 @@ export function buildOpenShiftAssignmentPlan(params: {
   const metrics = buildStaffFairnessMetrics(staff, shifts);
   const metricsMap = new Map<string, StaffFairnessMetric>(metrics.map((m) => [m.uid, { ...m }]));
 
-  const staffIntervalsByDate = new Map<string, { startTime: string; endTime: string }[]>();
-  const addOccupiedInterval = (uid: string, date: string, startTime: string, endTime: string) => {
-    const key = `${uid}__${date}`;
-    const list = staffIntervalsByDate.get(key) || [];
+  // Workplace-wide occupied intervals per date (only 1 worker every time)
+  const dayOccupiedIntervals = new Map<string, { startTime: string; endTime: string }[]>();
+  const addDayInterval = (date: string, startTime: string, endTime: string) => {
+    const list = dayOccupiedIntervals.get(date) || [];
     list.push({ startTime, endTime });
-    staffIntervalsByDate.set(key, list);
+    dayOccupiedIntervals.set(date, list);
   };
 
   for (const s of shifts) {
     if (s.assignedUid && s.status !== 'completed' && s.status !== 'open') {
-      addOccupiedInterval(s.assignedUid, s.date, s.startTime, s.endTime);
+      addDayInterval(s.date, s.startTime, s.endTime);
     }
   }
 
   const resolutions: FairnessResolutionItem[] = [];
 
   for (const shift of openShifts) {
+    // Skip if any worker already occupies an overlapping window on this date
+    const dayOccupied = dayOccupiedIntervals.get(shift.date) || [];
+    const overlapsExistingWorker = dayOccupied.some((iv) =>
+      timesOverlap(iv.startTime, iv.endTime, shift.startTime, shift.endTime)
+    );
+    if (overlapsExistingWorker) continue;
+
     const matchingUids = new Set(
       submissions
         .filter((sub) =>
@@ -479,13 +726,7 @@ export function buildOpenShiftAssignmentPlan(params: {
       .map((uid) => metricsMap.get(uid))
       .filter((m): m is StaffFairnessMetric => {
         if (!m) return false;
-        if (isStaffOffOnDate(m.uid, shift.date, timeOffRequests)) {
-          return false;
-        }
-        const occupied = staffIntervalsByDate.get(`${m.uid}__${shift.date}`) || [];
-        return !occupied.some((iv) =>
-          timesOverlap(iv.startTime, iv.endTime, shift.startTime, shift.endTime)
-        );
+        return !isStaffOffOnDate(m.uid, shift.date, timeOffRequests);
       });
 
     if (eligible.length === 0) continue;
@@ -532,19 +773,26 @@ export function buildOpenShiftAssignmentPlan(params: {
     chosen.effectiveTotalHours = Math.round((chosen.effectiveTotalHours + shift.durationHours) * 100) / 100;
     chosen.utilizationRatio = Math.round((chosen.effectiveTotalHours / chosen.weeklyHoursTarget) * 1000) / 1000;
     chosen.lastAssignedAt = `${shift.date}T${shift.startTime}`;
-    addOccupiedInterval(chosen.uid, shift.date, shift.startTime, shift.endTime);
+    addDayInterval(shift.date, shift.startTime, shift.endTime);
   }
 
   return resolutions;
 }
 
+export interface GeneratedWeeklyPlanResult {
+  drafts: GeneratedWeeklyShiftDraft[];
+  staleOpenShiftIds: string[];
+}
+
 /**
- * Generates a full 7-day weekly schedule starting on weekDates[0] (Monday).
- * - Skips slots already covered on the same date, department, and overlapping window.
- * - Strictly considers ONLY staff who submitted for that date/time/department AND do NOT have approved time off.
- * - If nobody submitted (or all submitters are on approved time off), leaves it blank (status: 'open', assignedUid: '').
- * - If multiple staff submitted, picks the staff member with the lowest working-time utilization ratio
- *   and prevents double-booking overlapping shifts on the same day.
+ * Generates a dynamic, non-overlapping 7-day weekly schedule starting on weekDates[0]:
+ * - Only 1 worker at any time on any day (no concurrent time overlaps across any department).
+ * - Strictly considers ONLY staff who submitted availability AND do NOT have approved time off.
+ * - If nobody is assigned on a day -> leaves ONE full-day blank ('open') column (08:00–22:00).
+ * - If someone gets a shift on that day (e.g. 08:00–16:00) -> splits the remaining uncovered
+ *   non-overlapping portion(s) of the day into open shift(s) (e.g. 16:00–22:00), never creating
+ *   an overlapping 12:00–20:00 block.
+ * - Identifies stale/overlapping open shift IDs in Firestore so they are cleaned up atomically.
  */
 export function generateWeeklyFairnessSchedule(params: {
   weekDates: string[];
@@ -554,60 +802,74 @@ export function generateWeeklyFairnessSchedule(params: {
   submissions: ShiftSubmission[];
   timeOffRequests?: TimeOffRequest[];
 }): GeneratedWeeklyShiftDraft[] {
+  return generateWeeklyFairnessPlan(params).drafts;
+}
+
+export function generateWeeklyFairnessPlan(params: {
+  weekDates: string[];
+  templates: WeeklySlotTemplate[];
+  existingShifts: Shift[];
+  staff: StaffDirectoryEntry[];
+  submissions: ShiftSubmission[];
+  timeOffRequests?: TimeOffRequest[];
+}): GeneratedWeeklyPlanResult {
   const { weekDates, templates, existingShifts, staff, submissions, timeOffRequests = [] } = params;
-  if (weekDates.length === 0 || templates.length === 0) {
-    return [];
+  if (weekDates.length === 0) {
+    return { drafts: [], staleOpenShiftIds: [] };
   }
 
   const metrics = buildStaffFairnessMetrics(staff, existingShifts);
   const metricsMap = new Map<string, StaffFairnessMetric>(metrics.map((m) => [m.uid, { ...m }]));
 
-  // Track all occupied intervals per staff member per day to avoid double-booking
-  const staffIntervalsByDate = new Map<string, { startTime: string; endTime: string }[]>();
-  const addOccupiedInterval = (uid: string, date: string, startTime: string, endTime: string) => {
-    if (!uid) return;
-    const key = `${uid}__${date}`;
-    const list = staffIntervalsByDate.get(key) || [];
-    list.push({ startTime, endTime });
-    staffIntervalsByDate.set(key, list);
-  };
-
-  for (const s of existingShifts) {
-    if (s.assignedUid && s.status !== 'completed' && s.status !== 'open') {
-      addOccupiedInterval(s.assignedUid, s.date, s.startTime, s.endTime);
-    }
-  }
+  const minTemplateStart =
+    templates.length > 0
+      ? templates.reduce(
+          (min, t) => (t.startTime < min ? t.startTime : min),
+          WORKDAY_START_TIME
+        )
+      : WORKDAY_START_TIME;
+  const maxTemplateEnd =
+    templates.length > 0
+      ? templates.reduce(
+          (max, t) => (t.endTime > max ? t.endTime : max),
+          WORKDAY_END_TIME
+        )
+      : WORKDAY_END_TIME;
 
   const drafts: GeneratedWeeklyShiftDraft[] = [];
+  const staleOpenShiftIds: string[] = [];
 
   for (let dayIdx = 0; dayIdx < weekDates.length; dayIdx++) {
     const date = weekDates[dayIdx];
-    const isWeekend = dayIdx >= 5; // Sat, Sun when week starts on Monday
+    const isWeekend = dayIdx >= 5;
 
-    for (const tpl of templates) {
-      if (isWeekend && !tpl.includeWeekends) continue;
+    const existingDayShifts = existingShifts.filter((s) => s.date === date);
+    const existingAssigned = existingDayShifts.filter(
+      (s) => s.status !== 'open' && Boolean(s.assignedUid)
+    );
+    const existingOpen = existingDayShifts.filter(
+      (s) => s.status === 'open' || !s.assignedUid
+    );
 
-      // Skip if an existing shift already covers this date + department + overlapping window
-      const alreadyCovered = existingShifts.some(
-        (s) =>
-          s.date === date &&
-          s.department.toLowerCase() === tpl.department.toLowerCase() &&
-          timesOverlap(s.startTime, s.endTime, tpl.startTime, tpl.endTime)
-      );
-      if (alreadyCovered) continue;
+    // Track all assigned time intervals on this date (1 worker at any time!)
+    const dayOccupied: Array<{ startTime: string; endTime: string }> = existingAssigned.map((s) => ({
+      startTime: s.startTime,
+      endTime: s.endTime,
+    }));
 
-      // Also skip if a draft in this batch already covers this department + overlapping window
-      const draftCovered = drafts.some(
-        (d) =>
-          d.date === date &&
-          d.department.toLowerCase() === tpl.department.toLowerCase() &&
-          timesOverlap(d.startTime, d.endTime, tpl.startTime, tpl.endTime)
-      );
-      if (draftCovered) continue;
+    const isTimeFreeOnDay = (startTime: string, endTime: string) =>
+      !dayOccupied.some((iv) => timesOverlap(iv.startTime, iv.endTime, startTime, endTime));
 
-      const durationHours = computeDurationHours(tpl.startTime, tpl.endTime, 0);
+    const newAssignedForDay: Shift[] = [];
 
-      // Strictly filter to staff who explicitly submitted for this slot
+    // 1. Try matching non-overlapping template windows with explicit staff submissions
+    const dayTemplates = templates
+      .filter((tpl) => !(isWeekend && !tpl.includeWeekends))
+      .sort((a, b) => a.startTime.localeCompare(b.startTime));
+
+    for (const tpl of dayTemplates) {
+      if (!isTimeFreeOnDay(tpl.startTime, tpl.endTime)) continue;
+
       const matchingSubUids = new Set(
         submissions
           .filter((sub) =>
@@ -621,39 +883,14 @@ export function generateWeeklyFairnessSchedule(params: {
           .map((sub) => sub.staffUid)
       );
 
-      let blockedByTimeOff = false;
       const eligibleMetrics = Array.from(matchingSubUids)
         .map((uid) => metricsMap.get(uid))
         .filter((m): m is StaffFairnessMetric => {
           if (!m) return false;
-          if (isStaffOffOnDate(m.uid, date, timeOffRequests)) {
-            blockedByTimeOff = true;
-            return false;
-          }
-          const occupied = staffIntervalsByDate.get(`${m.uid}__${date}`) || [];
-          return !occupied.some((iv) =>
-            timesOverlap(iv.startTime, iv.endTime, tpl.startTime, tpl.endTime)
-          );
+          return !isStaffOffOnDate(m.uid, date, timeOffRequests);
         });
 
-      if (eligibleMetrics.length === 0) {
-        // Leave blank — never assign someone who didn't submit or is on approved time off
-        drafts.push({
-          title: tpl.title,
-          department: tpl.department,
-          date,
-          startTime: tpl.startTime,
-          endTime: tpl.endTime,
-          durationHours,
-          assignedUid: '',
-          assignedName: '',
-          status: 'open',
-          fairnessNote: blockedByTimeOff
-            ? 'Left blank — submitted staff have approved time off on this date.'
-            : 'Left blank — no staff submitted for this shift.',
-        });
-        continue;
-      }
+      if (eligibleMetrics.length === 0) continue;
 
       eligibleMetrics.sort((a, b) => {
         if (Math.abs(a.utilizationRatio - b.utilizationRatio) > 0.005) {
@@ -671,13 +908,14 @@ export function generateWeeklyFairnessSchedule(params: {
       const chosen = eligibleMetrics[0];
       const beforeHours = chosen.effectiveTotalHours;
       const beforePct = Math.round(chosen.utilizationRatio * 100);
+      const durationHours = computeDurationHours(tpl.startTime, tpl.endTime, 0);
 
       chosen.effectiveTotalHours = Math.round((chosen.effectiveTotalHours + durationHours) * 100) / 100;
       chosen.utilizationRatio = Math.round((chosen.effectiveTotalHours / chosen.weeklyHoursTarget) * 1000) / 1000;
       chosen.lastAssignedAt = `${date}T${tpl.startTime}`;
-      addOccupiedInterval(chosen.uid, date, tpl.startTime, tpl.endTime);
+      dayOccupied.push({ startTime: tpl.startTime, endTime: tpl.endTime });
 
-      drafts.push({
+      const draft: GeneratedWeeklyShiftDraft = {
         title: tpl.title,
         department: tpl.department,
         date,
@@ -691,9 +929,115 @@ export function generateWeeklyFairnessSchedule(params: {
           eligibleMetrics.length === 1
             ? `Assigned to ${chosen.displayName} (submitted for this shift).`
             : `Fairness selected ${chosen.displayName} (${beforeHours.toFixed(1)}h/${chosen.weeklyHoursTarget}h, ${beforePct}% load) from ${eligibleMetrics.length} submissions.`,
+      };
+      drafts.push(draft);
+      newAssignedForDay.push({
+        id: `draft_${date}_${tpl.startTime}`,
+        ...draft,
+        candidateUids: [chosen.uid],
+        visibility: 'team',
+        createdBy: '',
+        createdAt: null,
+        updatedAt: null,
+      });
+    }
+
+    // 2. Also assign any remaining explicit submissions whose windows don't overlap already-assigned shifts
+    const daySubmissions = submissions
+      .filter((sub) => sub.status === 'submitted' && sub.date === date)
+      .sort((a, b) => a.startTime.localeCompare(b.startTime));
+
+    for (const sub of daySubmissions) {
+      if (!isTimeFreeOnDay(sub.startTime, sub.endTime)) continue;
+      if (isStaffOffOnDate(sub.staffUid, date, timeOffRequests)) continue;
+
+      const sameWindowSubs = daySubmissions.filter(
+        (other) =>
+          other.startTime === sub.startTime &&
+          other.endTime === sub.endTime &&
+          !isStaffOffOnDate(other.staffUid, date, timeOffRequests)
+      );
+      const candidateMetrics = Array.from(new Set(sameWindowSubs.map((s) => s.staffUid)))
+        .map((uid) => metricsMap.get(uid))
+        .filter((m): m is StaffFairnessMetric => Boolean(m));
+
+      if (candidateMetrics.length === 0) continue;
+
+      candidateMetrics.sort((a, b) => {
+        if (Math.abs(a.utilizationRatio - b.utilizationRatio) > 0.005) {
+          return a.utilizationRatio - b.utilizationRatio;
+        }
+        return a.effectiveTotalHours - b.effectiveTotalHours;
+      });
+
+      const chosen = candidateMetrics[0];
+      const winningSub = sameWindowSubs.find((s) => s.staffUid === chosen.uid) || sub;
+      const durationHours = computeDurationHours(sub.startTime, sub.endTime, 0);
+
+      chosen.effectiveTotalHours = Math.round((chosen.effectiveTotalHours + durationHours) * 100) / 100;
+      chosen.utilizationRatio = Math.round((chosen.effectiveTotalHours / chosen.weeklyHoursTarget) * 1000) / 1000;
+      dayOccupied.push({ startTime: sub.startTime, endTime: sub.endTime });
+
+      const draft: GeneratedWeeklyShiftDraft = {
+        title: winningSub.shiftTitle || 'Submitted Shift Coverage',
+        department: winningSub.department || chosen.department,
+        date,
+        startTime: sub.startTime,
+        endTime: sub.endTime,
+        durationHours,
+        assignedUid: chosen.uid,
+        assignedName: chosen.displayName,
+        status: 'scheduled',
+        fairnessNote: `Assigned to ${chosen.displayName} from submitted availability.`,
+      };
+      drafts.push(draft);
+      newAssignedForDay.push({
+        id: `draft_sub_${date}_${sub.startTime}`,
+        ...draft,
+        candidateUids: [chosen.uid],
+        visibility: 'team',
+        createdBy: '',
+        createdAt: null,
+        updatedAt: null,
+      });
+    }
+
+    // 3. Dynamically split the remaining uncovered non-overlapping day gaps & clean stale open shifts
+    const combinedDayShifts: Shift[] = [...existingAssigned, ...existingOpen, ...newAssignedForDay];
+    const partition = partitionDayTimeline(
+      date,
+      combinedDayShifts,
+      minTemplateStart,
+      maxTemplateEnd
+    );
+
+    staleOpenShiftIds.push(...partition.staleOpenShiftIds);
+
+    for (const gap of partition.openGaps) {
+      const key = `${gap.startTime}-${gap.endTime}`;
+      if (partition.matchingOpenShifts.has(key)) continue;
+
+      const isFullDay =
+        partition.assignedShifts.length === 0 &&
+        gap.startTime === minTemplateStart &&
+        gap.endTime === maxTemplateEnd;
+
+      drafts.push({
+        title: isFullDay ? 'Full Day Coverage (Open)' : 'Open Shift Coverage',
+        department: templates[0]?.department || 'Operations',
+        date,
+        startTime: gap.startTime,
+        endTime: gap.endTime,
+        durationHours: gap.durationHours,
+        assignedUid: '',
+        assignedName: '',
+        status: 'open',
+        fairnessNote: isFullDay
+          ? 'Full-day open column — no staff submitted or assigned yet.'
+          : 'Non-overlapping open shift gap after assigned shift.',
       });
     }
   }
 
-  return drafts;
+  return { drafts, staleOpenShiftIds };
 }

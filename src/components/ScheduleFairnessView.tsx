@@ -28,12 +28,15 @@ import {
   buildFairnessArrangementPlan,
   buildOpenShiftAssignmentPlan,
   buildStaffFairnessMetrics,
+  computeDurationHours,
   DEFAULT_WEEKLY_TEMPLATES,
   detectOverlaps,
   doesSubmissionMatchSlot,
-  generateWeeklyFairnessSchedule,
+  generateWeeklyFairnessPlan,
   isStaffOffOnDate,
+  needsScheduleNormalization,
   selectFairestCandidate,
+  timesOverlap,
   WeeklySlotTemplate,
 } from '../utils/fairness';
 import {
@@ -42,7 +45,9 @@ import {
   createScheduleChangeRequest,
   createShiftRecord,
   deleteShiftRecord,
+  reconcileDayOpenSlotsInFirestore,
   submitShiftAvailability,
+  syncNonOverlappingWeekInFirestore,
   updateShiftManually,
   withdrawShiftSubmission,
 } from '../services/firestoreService';
@@ -173,6 +178,11 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
     [shifts]
   );
 
+  const weekNeedsSync = useMemo(
+    () => needsScheduleNormalization(getWeekDates(selectedWeekMonday), shifts),
+    [selectedWeekMonday, shifts]
+  );
+
   const filteredShifts = useMemo(() => {
     return shifts.filter((s) => {
       if (filter === 'mine' && s.assignedUid !== profile.uid) return false;
@@ -254,6 +264,22 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
     onNotifyBanner('Shift submission withdrawn.');
   };
 
+  const handleSyncNonOverlappingWeek = async () => {
+    if (!isManager) return;
+    setBusy(true);
+    try {
+      const weekDates = getWeekDates(selectedWeekMonday);
+      const result = await syncNonOverlappingWeekInFirestore(weekDates, shifts, profile);
+      onNotifyBanner(
+        result.removed === 0 && result.created === 0
+          ? `Week of ${selectedWeekMonday} is already synced with zero overlapping shifts.`
+          : `Synced week of ${selectedWeekMonday} to Firebase (Web & Android): removed ${result.removed} overlapping/fragmented open slot(s), created ${result.created} clean non-overlapping slot(s).`
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleAssignOpenFromSubmissions = async () => {
     if (!isManager || openAssignmentPlan.length === 0) return;
     setBusy(true);
@@ -264,6 +290,33 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
         staffDirectory,
         profile
       );
+
+      // Reconcile affected dates in Firestore so open slots split cleanly around newly assigned shifts
+      const resMap = new Map(openAssignmentPlan.map((r) => [r.shiftId, r]));
+      const simulatedShifts: Shift[] = shifts.map((s) => {
+        const res = resMap.get(s.id);
+        if (!res) return s;
+        return {
+          ...s,
+          date: res.newDate || s.date,
+          startTime: res.newStartTime || s.startTime,
+          endTime: res.newEndTime || s.endTime,
+          assignedUid: res.selectedAssigneeUid,
+          assignedName: res.selectedAssigneeName,
+          status: 'scheduled',
+        };
+      });
+      const affectedDates = Array.from(
+        new Set(openAssignmentPlan.map((r) => r.newDate || r.date))
+      );
+      for (const date of affectedDates) {
+        await reconcileDayOpenSlotsInFirestore(
+          date,
+          simulatedShifts.filter((s) => s.date === date),
+          profile.uid
+        );
+      }
+
       onNotifyBanner(
         `Assigned ${count} open shift(s) to submitted staff based on working-time fairness.`
       );
@@ -274,7 +327,7 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
 
   /**
    * One-Click Full Week Schedule Generator + Overlap Fairness Resolution
-   * Only assigns users who explicitly submitted for that shift; unsubmitted slots remain blank (open).
+   * Enforces 1 worker at any time, dynamically splits open gaps, and syncs to Firestore for Web & Android.
    */
   const handleOneClickGenerateWeek = async (activeTemplates = templates) => {
     if (!isManager) return;
@@ -283,6 +336,7 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
     try {
       const weekDates = getWeekDates(selectedWeekMonday);
       let resolvedOverlaps = 0;
+      let effectiveShifts = shifts;
 
       // First resolve any existing overlaps in the database by working-time fairness
       if (fairnessPlan.length > 0) {
@@ -292,22 +346,40 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
           staffDirectory,
           profile
         );
+        const planByShiftId = new Map(fairnessPlan.map((r) => [r.shiftId, r]));
+        effectiveShifts = shifts.map((s) => {
+          const res = planByShiftId.get(s.id);
+          if (!res) return s;
+          const nextStart = res.newStartTime || s.startTime;
+          const nextEnd = res.newEndTime || s.endTime;
+          return {
+            ...s,
+            date: res.newDate || s.date,
+            startTime: nextStart,
+            endTime: nextEnd,
+            durationHours: computeDurationHours(nextStart, nextEnd, 0),
+            assignedUid: res.selectedAssigneeUid,
+            assignedName: res.selectedAssigneeName,
+            candidateUids: [res.selectedAssigneeUid],
+            status: 'scheduled',
+          };
+        });
       }
 
-      const drafts = generateWeeklyFairnessSchedule({
+      const { drafts, staleOpenShiftIds } = generateWeeklyFairnessPlan({
         weekDates,
         templates: activeTemplates,
-        existingShifts: shifts,
+        existingShifts: effectiveShifts,
         staff: staffDirectory,
         submissions: activeSubmissions,
         timeOffRequests,
       });
 
-      if (drafts.length === 0) {
+      if (drafts.length === 0 && staleOpenShiftIds.length === 0) {
         onNotifyBanner(
           resolvedOverlaps > 0
-            ? `Resolved ${resolvedOverlaps} overlap(s) by fairness; all slots for the week of ${selectedWeekMonday} are already on the calendar.`
-            : `All shift slots for the week of ${selectedWeekMonday} are already on the calendar.`
+            ? `Resolved ${resolvedOverlaps} overlap(s) by fairness; all non-overlapping slots for the week of ${selectedWeekMonday} are synced.`
+            : `All non-overlapping shift slots for the week of ${selectedWeekMonday} are already synced.`
         );
         setShowWeekConfig(false);
         return;
@@ -317,15 +389,16 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
         drafts,
         selectedWeekMonday,
         staffDirectory,
-        profile
+        profile,
+        staleOpenShiftIds
       );
 
       setShowWeekConfig(false);
       setViewMode('calendar');
       onNotifyBanner(
-        `Generated week of ${selectedWeekMonday}: ${result.assignedCount} assigned from submissions, ${result.openCount} left blank (no submission)${
-          resolvedOverlaps > 0 ? `, and ${resolvedOverlaps} overlap(s) resolved` : ''
-        }.`
+        `Synced week of ${selectedWeekMonday}: ${result.assignedCount} assigned from submissions, ${result.openCount} non-overlapping open slot(s)${
+          result.cleanedCount > 0 ? `, cleaned ${result.cleanedCount} overlapping slot(s)` : ''
+        }${resolvedOverlaps > 0 ? `, and ${resolvedOverlaps} overlap(s) resolved` : ''}.`
       );
     } finally {
       setBusy(false);
@@ -340,7 +413,7 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
     setBusy(true);
     try {
       if (selectedCandidateUids.length === 0) {
-        await createShiftRecord({
+        const createdId = await createShiftRecord({
           title: newTitle,
           department: newDept,
           date: newDate,
@@ -353,6 +426,7 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
           fairnessNote: 'Created as an open/blank slot — waiting for staff submissions.',
           actorUid: profile.uid,
         });
+        void createdId;
         setShowNewShift(false);
         setNewTitle('');
         onNotifyBanner('Created open shift slot (left blank until staff submit).');
@@ -392,7 +466,25 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
         return;
       }
 
-      await createShiftRecord({
+      // Enforce 1 worker at any time across the entire workplace when assigning a shift
+      if (status !== 'conflict') {
+        const overlappingAssigned = shifts.find(
+          (s) =>
+            s.date === newDate &&
+            s.status !== 'open' &&
+            Boolean(s.assignedUid) &&
+            timesOverlap(s.startTime, s.endTime, newStart, newEnd)
+        );
+        if (overlappingAssigned) {
+          onNotifyBanner(
+            `Cannot assign ${newStart}–${newEnd} on ${newDate}: overlaps ${overlappingAssigned.assignedName} (${overlappingAssigned.startTime}–${overlappingAssigned.endTime}). Only 1 worker per time slot.`
+          );
+          setBusy(false);
+          return;
+        }
+      }
+
+      const createdId = await createShiftRecord({
         title: newTitle,
         department: newDept,
         date: newDate,
@@ -406,12 +498,38 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
         actorUid: profile.uid,
       });
 
+      if (isManager) {
+        const newShiftSim: Shift = {
+          id: createdId,
+          title: newTitle.trim(),
+          department: newDept.trim(),
+          date: newDate,
+          startTime: newStart,
+          endTime: newEnd,
+          durationHours: computeDurationHours(newStart, newEnd, 0),
+          assignedUid: chosenUid,
+          assignedName: chosenName,
+          candidateUids: candidatesToSave,
+          status,
+          visibility: 'team',
+          fairnessNote,
+          createdBy: profile.uid,
+          createdAt: null,
+          updatedAt: null,
+        };
+        const simulatedDayShifts = [
+          ...shifts.filter((s) => s.date === newDate),
+          newShiftSim,
+        ];
+        await reconcileDayOpenSlotsInFirestore(newDate, simulatedDayShifts, profile.uid);
+      }
+
       setShowNewShift(false);
       setNewTitle('');
       onNotifyBanner(
         selectedCandidateUids.length > 1 && autoArrangeOnCreate
-          ? `Shift assigned to ${chosenName} based on working-time fairness.`
-          : 'Shift created and notification dispatched.'
+          ? `Shift assigned to ${chosenName} based on working-time fairness and synced.`
+          : 'Shift created and synced.'
       );
     } finally {
       setBusy(false);
@@ -444,6 +562,24 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
         ? ''
         : staffMember?.displayName || editingShift.assignedName;
 
+      if (!isBlank) {
+        const overlappingOther = shifts.find(
+          (s) =>
+            s.id !== editingShift.id &&
+            s.date === editDate &&
+            s.status !== 'open' &&
+            Boolean(s.assignedUid) &&
+            timesOverlap(s.startTime, s.endTime, editStart, editEnd)
+        );
+        if (overlappingOther) {
+          onNotifyBanner(
+            `Cannot save ${editStart}–${editEnd} on ${editDate}: overlaps ${overlappingOther.assignedName} (${overlappingOther.startTime}–${overlappingOther.endTime}). Only 1 worker per time slot.`
+          );
+          setBusy(false);
+          return;
+        }
+      }
+
       await updateShiftManually(
         editingShift,
         {
@@ -460,11 +596,41 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
         profile
       );
 
+      // Reconcile open slots on the edited date (and original date if moved) for Web & Android sync
+      const updatedShiftSim: Shift = {
+        ...editingShift,
+        title: editTitle.trim(),
+        department: editDept.trim(),
+        date: editDate,
+        startTime: editStart,
+        endTime: editEnd,
+        durationHours: computeDurationHours(editStart, editEnd, 0),
+        assignedUid: isBlank ? '' : editAssignedUid,
+        assignedName,
+        candidateUids: isBlank ? [] : [editAssignedUid],
+        status: isBlank ? 'open' : editStatus,
+      };
+      const simulatedAll = shifts.map((s) =>
+        s.id === editingShift.id ? updatedShiftSim : s
+      );
+      await reconcileDayOpenSlotsInFirestore(
+        editDate,
+        simulatedAll.filter((s) => s.date === editDate),
+        profile.uid
+      );
+      if (editingShift.date !== editDate) {
+        await reconcileDayOpenSlotsInFirestore(
+          editingShift.date,
+          simulatedAll.filter((s) => s.date === editingShift.date),
+          profile.uid
+        );
+      }
+
       setEditingShift(null);
       onNotifyBanner(
         isBlank
-          ? `Left "${editTitle}" (${editDate} ${editStart}–${editEnd}) blank / open.`
-          : `Updated "${editTitle}" (${editDate} ${editStart}–${editEnd}) for ${assignedName}.`
+          ? `Left "${editTitle}" (${editDate} ${editStart}–${editEnd}) open and synced.`
+          : `Updated "${editTitle}" (${editDate} ${editStart}–${editEnd}) for ${assignedName} and synced.`
       );
     } finally {
       setBusy(false);
@@ -476,8 +642,12 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
     setBusy(true);
     try {
       await deleteShiftRecord(shift.id);
+      const remainingDayShifts = shifts.filter(
+        (s) => s.id !== shift.id && s.date === shift.date
+      );
+      await reconcileDayOpenSlotsInFirestore(shift.date, remainingDayShifts, profile.uid);
       setEditingShift(null);
-      onNotifyBanner(`Removed shift "${shift.title}" (${shift.date}).`);
+      onNotifyBanner(`Removed shift "${shift.title}" (${shift.date}) and synced open timeline.`);
     } finally {
       setBusy(false);
     }
@@ -493,8 +663,36 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
         staffDirectory,
         profile
       );
+
+      const resMap = new Map(fairnessPlan.map((r) => [r.shiftId, r]));
+      const simulatedShifts: Shift[] = shifts.map((s) => {
+        const res = resMap.get(s.id);
+        if (!res) return s;
+        return {
+          ...s,
+          date: res.newDate || s.date,
+          startTime: res.newStartTime || s.startTime,
+          endTime: res.newEndTime || s.endTime,
+          assignedUid: res.selectedAssigneeUid,
+          assignedName: res.selectedAssigneeName,
+          status: 'scheduled',
+        };
+      });
+      const affectedDates = Array.from(
+        new Set(
+          fairnessPlan.flatMap((r) => (r.newDate && r.newDate !== r.date ? [r.date, r.newDate] : [r.date]))
+        )
+      );
+      for (const date of affectedDates) {
+        await reconcileDayOpenSlotsInFirestore(
+          date,
+          simulatedShifts.filter((s) => s.date === date),
+          profile.uid
+        );
+      }
+
       onNotifyBanner(
-        `Fairness arrangement applied across ${count} overlapping shift(s) and staff notified.`
+        `Fairness arrangement applied across ${count} overlapping shift(s), synced for Web & Android.`
       );
     } finally {
       setBusy(false);
@@ -617,6 +815,29 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Sync Non-Overlapping Week to Firebase Banner (Web & Android Sync) */}
+      {isManager && weekNeedsSync && (
+        <div className="bg-slate-50 border border-slate-300 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="space-y-0.5">
+            <div className="text-xs font-semibold text-slate-900">
+              Legacy Overlapping or Fragmented Open Slots Detected in Firebase
+            </div>
+            <p className="text-xs text-slate-600">
+              Sync this week so empty days use one full 08:00–22:00 column and assigned days split cleanly with zero overlap on both Web and Android.
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={handleSyncNonOverlappingWeek}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <CheckCircle2 className="w-3.5 h-3.5" />
+            {busy ? 'Syncing...' : 'Sync Non-Overlapping Week to Firebase'}
+          </button>
+        </div>
+      )}
 
       {/* Open Shifts with Matching Submissions Banner (Manager Action) */}
       {isManager && openAssignmentPlan.length > 0 && (
@@ -799,14 +1020,31 @@ export const ScheduleFairnessView: React.FC<ScheduleFairnessViewProps> = ({
         <ShiftCalendarView
           profile={profile}
           shifts={filteredShifts}
+          allShiftsForOverlapCheck={shifts}
           shiftSubmissions={activeSubmissions}
           selectedWeekMonday={selectedWeekMonday}
+          isFullScheduleView={filter === 'all' && !search.trim()}
           onChangeWeekMonday={setSelectedWeekMonday}
           onEditShift={openEditModal}
           onDeleteShift={handleDeleteShift}
           onRequestChange={openChangeModal}
           onSubmitForShift={handleSubmitForOpenShift}
           onWithdrawSubmission={handleWithdrawSubmission}
+          onQuickSelectOpenWindow={({ date, startTime, endTime }) => {
+            if (isManager) {
+              setNewTitle('Open Shift Coverage');
+              setNewDate(date);
+              setNewStart(startTime);
+              setNewEnd(endTime);
+              setSelectedCandidateUids([]);
+              setShowNewShift(true);
+            } else {
+              setSubDates([date]);
+              setSubStart(startTime);
+              setSubEnd(endTime);
+              setShowSubmitShift(true);
+            }
+          }}
           onNotifyBanner={onNotifyBanner}
         />
       ) : viewMode === 'submissions' ? (

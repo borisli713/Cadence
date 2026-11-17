@@ -12,7 +12,11 @@ import {
   X,
 } from 'lucide-react';
 import { Shift, ShiftSubmission, UserProfile } from '../types';
-import { doesSubmissionMatchSlot } from '../utils/fairness';
+import {
+  doesSubmissionMatchSlot,
+  parseTimeToMinutes,
+  partitionDayTimeline,
+} from '../utils/fairness';
 import {
   addDaysIso,
   buildGoogleCalendarUrl,
@@ -27,30 +31,60 @@ import {
 interface ShiftCalendarViewProps {
   profile: UserProfile;
   shifts: Shift[];
+  allShiftsForOverlapCheck?: Shift[];
   shiftSubmissions: ShiftSubmission[];
   selectedWeekMonday: string;
+  isFullScheduleView?: boolean;
   onChangeWeekMonday: (mondayIso: string) => void;
   onEditShift: (shift: Shift) => void;
   onDeleteShift: (shift: Shift) => void;
   onRequestChange: (shift: Shift) => void;
   onSubmitForShift: (shift: Shift) => Promise<void>;
   onWithdrawSubmission: (submissionId: string) => Promise<void>;
+  onQuickSelectOpenWindow?: (window: {
+    date: string;
+    startTime: string;
+    endTime: string;
+  }) => void;
   onNotifyBanner: (msg: string) => void;
 }
+
+type DayTimelineBlock =
+  | {
+      kind: 'shift';
+      key: string;
+      shift: Shift;
+      startTime: string;
+      endTime: string;
+      durationMinutes: number;
+    }
+  | {
+      kind: 'virtual_open';
+      key: string;
+      date: string;
+      startTime: string;
+      endTime: string;
+      durationHours: number;
+      durationMinutes: number;
+      isFullDay: boolean;
+    };
 
 const WEEKDAY_SHORT = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
   profile,
   shifts,
+  allShiftsForOverlapCheck,
   shiftSubmissions,
   selectedWeekMonday,
+  isFullScheduleView = true,
   onChangeWeekMonday,
   onEditShift,
   onDeleteShift,
   onRequestChange,
   onSubmitForShift,
   onWithdrawSubmission,
+  onQuickSelectOpenWindow,
   onNotifyBanner,
 }) => {
   const isManager = profile.role === 'manager';
@@ -82,6 +116,17 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
     }
     return map;
   }, [shifts]);
+
+  const referenceByDate = useMemo(() => {
+    const source = allShiftsForOverlapCheck || shifts;
+    const map = new Map<string, Shift[]>();
+    for (const s of source) {
+      const arr = map.get(s.date) || [];
+      arr.push(s);
+      map.set(s.date, arr);
+    }
+    return map;
+  }, [allShiftsForOverlapCheck, shifts]);
 
   const visibleShiftsForExport = useMemo(() => {
     const allowedDates = new Set(granularity === 'week' ? weekDates : monthGridDates);
@@ -141,7 +186,10 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
   };
 
   const handleExportMine = () => {
-    const source = myVisibleShifts.length > 0 ? myVisibleShifts : shifts.filter((s) => s.assignedUid === profile.uid);
+    const source =
+      myVisibleShifts.length > 0
+        ? myVisibleShifts
+        : shifts.filter((s) => s.assignedUid === profile.uid);
     if (source.length === 0) {
       onNotifyBanner('You do not have any assigned shifts to export yet.');
       return;
@@ -156,7 +204,12 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
 
   const [submittingShiftId, setSubmittingShiftId] = useState<string | null>(null);
 
-  const getMyMatchingSubmission = (shift: Shift) =>
+  const getMyMatchingSubmission = (shift: {
+    date: string;
+    startTime: string;
+    endTime: string;
+    department: string;
+  }) =>
     shiftSubmissions.find(
       (sub) =>
         sub.staffUid === profile.uid &&
@@ -168,7 +221,12 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
         })
     );
 
-  const getMatchingSubmissionsCount = (shift: Shift) =>
+  const getMatchingSubmissionsCount = (shift: {
+    date: string;
+    startTime: string;
+    endTime: string;
+    department: string;
+  }) =>
     shiftSubmissions.filter((sub) =>
       doesSubmissionMatchSlot(sub, {
         date: shift.date,
@@ -200,6 +258,114 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
       return <span className="text-emerald-700 font-medium">Completed</span>;
     }
     return <span className="text-slate-500">Scheduled</span>;
+  };
+
+  const buildDayTimelineBlocks = (dateIso: string): DayTimelineBlock[] => {
+    const dayShifts = shiftsByDate.get(dateIso) || [];
+
+    if (!isFullScheduleView) {
+      // Filtered mode (e.g. My Shifts, Open / Blank, Completed, or search)
+      const refShifts = referenceByDate.get(dateIso) || dayShifts;
+      const partition = partitionDayTimeline(dateIso, refShifts);
+      const filteredSet = new Set(dayShifts.map((s) => s.id));
+      const blocks: DayTimelineBlock[] = [];
+
+      // Always keep matching assigned shifts
+      for (const s of dayShifts) {
+        if (s.status !== 'open' && Boolean(s.assignedUid)) {
+          blocks.push({
+            kind: 'shift',
+            key: s.id,
+            shift: s,
+            startTime: s.startTime,
+            endTime: s.endTime,
+            durationMinutes: Math.max(60, Math.round(s.durationHours * 60)),
+          });
+        }
+      }
+
+      // Only show open gaps that do not overlap assigned shifts
+      const hasOpenInFilter = dayShifts.some((s) => s.status === 'open' || !s.assignedUid);
+      if (hasOpenInFilter) {
+        for (const gap of partition.openGaps) {
+          const match = partition.matchingOpenShifts.get(`${gap.startTime}-${gap.endTime}`);
+          if (match && filteredSet.has(match.id)) {
+            blocks.push({
+              kind: 'shift',
+              key: match.id,
+              shift: match,
+              startTime: match.startTime,
+              endTime: match.endTime,
+              durationMinutes: Math.max(60, Math.round(match.durationHours * 60)),
+            });
+          } else {
+            blocks.push({
+              kind: 'virtual_open',
+              key: `vopen_${dateIso}_${gap.startTime}_${gap.endTime}`,
+              date: dateIso,
+              startTime: gap.startTime,
+              endTime: gap.endTime,
+              durationHours: gap.durationHours,
+              durationMinutes: Math.max(60, Math.round(gap.durationHours * 60)),
+              isFullDay: partition.assignedShifts.length === 0,
+            });
+          }
+        }
+      }
+
+      blocks.sort(
+        (a, b) => parseTimeToMinutes(a.startTime) - parseTimeToMinutes(b.startTime)
+      );
+      return blocks;
+    }
+
+    // Full schedule view: dynamic non-overlapping split per day!
+    // - 0 assigned shifts -> 1 full-day column (08:00–22:00)
+    // - >=1 assigned shifts -> split around assigned shift(s) with zero time overlap
+    const partition = partitionDayTimeline(dateIso, dayShifts);
+    const blocks: DayTimelineBlock[] = [];
+
+    for (const s of partition.assignedShifts) {
+      blocks.push({
+        kind: 'shift',
+        key: s.id,
+        shift: s,
+        startTime: s.startTime,
+        endTime: s.endTime,
+        durationMinutes: Math.max(60, Math.round(s.durationHours * 60)),
+      });
+    }
+
+    for (const gap of partition.openGaps) {
+      const gapKey = `${gap.startTime}-${gap.endTime}`;
+      const existingDoc = partition.matchingOpenShifts.get(gapKey);
+      if (existingDoc) {
+        blocks.push({
+          kind: 'shift',
+          key: existingDoc.id,
+          shift: existingDoc,
+          startTime: existingDoc.startTime,
+          endTime: existingDoc.endTime,
+          durationMinutes: Math.max(60, Math.round(existingDoc.durationHours * 60)),
+        });
+      } else {
+        blocks.push({
+          kind: 'virtual_open',
+          key: `vopen_${dateIso}_${gap.startTime}_${gap.endTime}`,
+          date: dateIso,
+          startTime: gap.startTime,
+          endTime: gap.endTime,
+          durationHours: gap.durationHours,
+          durationMinutes: Math.max(60, Math.round(gap.durationHours * 60)),
+          isFullDay: partition.assignedShifts.length === 0,
+        });
+      }
+    }
+
+    blocks.sort(
+      (a, b) => parseTimeToMinutes(a.startTime) - parseTimeToMinutes(b.startTime)
+    );
+    return blocks;
   };
 
   return (
@@ -284,18 +450,18 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
         </div>
       </div>
 
-      {/* Week Grid */}
+      {/* Week Grid — Dynamic Non-Overlapping Column Splitting */}
       {granularity === 'week' ? (
         <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
           <div className="grid grid-cols-1 md:grid-cols-7 divide-y md:divide-y-0 md:divide-x divide-slate-200">
             {weekDates.map((dateIso, idx) => {
-              const dayShifts = shiftsByDate.get(dateIso) || [];
+              const blocks = buildDayTimelineBlocks(dateIso);
               const dateObj = parseIsoDateLocal(dateIso);
               const isToday = dateIso === todayIso;
               const dayNum = dateObj.getDate();
 
               return (
-                <div key={dateIso} className="flex flex-col min-h-[260px]">
+                <div key={dateIso} className="flex flex-col">
                   <div
                     className={`px-3 py-2.5 border-b border-slate-200 flex items-center justify-between ${
                       isToday ? 'bg-blue-50/70' : 'bg-slate-50/60'
@@ -313,23 +479,104 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
                     </span>
                   </div>
 
-                  <div className="p-2 space-y-2 flex-1">
-                    {dayShifts.length === 0 ? (
-                      <div className="h-full min-h-[120px] flex items-center justify-center text-[11px] text-slate-400">
-                        No shifts
+                  <div className="p-2 flex flex-col gap-2 flex-1 min-h-[380px]">
+                    {blocks.length === 0 ? (
+                      <div className="flex-1 flex items-center justify-center text-[11px] text-slate-400">
+                        No matching shifts
                       </div>
                     ) : (
-                      dayShifts.map((shift) => {
+                      blocks.map((block) => {
+                        if (block.kind === 'virtual_open') {
+                          const mySub = getMyMatchingSubmission({
+                            date: block.date,
+                            startTime: block.startTime,
+                            endTime: block.endTime,
+                            department: 'Operations',
+                          });
+                          const subCount = getMatchingSubmissionsCount({
+                            date: block.date,
+                            startTime: block.startTime,
+                            endTime: block.endTime,
+                            department: 'Operations',
+                          });
+
+                          return (
+                            <button
+                              key={block.key}
+                              type="button"
+                              style={{
+                                flexGrow: block.durationMinutes,
+                                flexBasis: 0,
+                                minHeight: block.isFullDay ? '180px' : '76px',
+                              }}
+                              onClick={() => {
+                                if (onQuickSelectOpenWindow) {
+                                  onQuickSelectOpenWindow({
+                                    date: block.date,
+                                    startTime: block.startTime,
+                                    endTime: block.endTime,
+                                  });
+                                }
+                              }}
+                              className="w-full text-left p-2.5 rounded-lg border border-dashed border-slate-300 bg-slate-50/70 hover:bg-slate-100/80 transition-colors flex flex-col justify-between gap-2 cursor-pointer"
+                            >
+                              <div className="space-y-1 min-w-0">
+                                <div className="flex items-center justify-between gap-1 text-[11px] font-mono tabular-nums text-slate-600">
+                                  <span>
+                                    {block.startTime}–{block.endTime}
+                                  </span>
+                                  <span>{block.durationHours.toFixed(1)}h</span>
+                                </div>
+                                <div className="text-xs font-semibold text-slate-900 truncate">
+                                  {block.isFullDay
+                                    ? 'Full Day Coverage (Open)'
+                                    : 'Open Shift Gap'}
+                                </div>
+                                <div className="text-[11px] text-slate-600 truncate">
+                                  Unassigned · 1 worker max
+                                </div>
+                              </div>
+
+                              <div className="text-[11px]">
+                                {mySub ? (
+                                  <span className="text-blue-700 font-medium">
+                                    Open · You Submitted
+                                  </span>
+                                ) : isManager && subCount > 0 ? (
+                                  <span className="text-blue-700 font-medium">
+                                    Open · {subCount} Submitted
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-500">
+                                    {isManager
+                                      ? 'Open · Click to assign'
+                                      : 'Open · Click to submit'}
+                                  </span>
+                                )}
+                              </div>
+                            </button>
+                          );
+                        }
+
+                        const shift = block.shift;
                         const isOpen = shift.status === 'open' || !shift.assignedUid;
                         const isMine = !isOpen && shift.assignedUid === profile.uid;
                         const isConflict =
-                          !isOpen && (shift.status === 'conflict' || shift.candidateUids.length > 1);
+                          !isOpen &&
+                          (shift.status === 'conflict' || shift.candidateUids.length > 1);
+                        const isFullOpenDay = isOpen && blocks.length === 1;
+
                         return (
                           <button
-                            key={shift.id}
+                            key={block.key}
                             type="button"
+                            style={{
+                              flexGrow: block.durationMinutes,
+                              flexBasis: 0,
+                              minHeight: isFullOpenDay ? '180px' : '76px',
+                            }}
                             onClick={() => setInspectedShift(shift)}
-                            className={`w-full text-left p-2.5 rounded-lg border transition-colors space-y-1 cursor-pointer ${
+                            className={`w-full text-left p-2.5 rounded-lg border transition-colors flex flex-col justify-between gap-2 cursor-pointer ${
                               isOpen
                                 ? 'bg-slate-50/70 border-dashed border-slate-300 hover:bg-slate-100/80'
                                 : isConflict
@@ -339,17 +586,19 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
                                 : 'bg-white border-slate-200 hover:bg-slate-50'
                             }`}
                           >
-                            <div className="flex items-center justify-between gap-1 text-[11px] font-mono tabular-nums text-slate-600">
-                              <span>
-                                {shift.startTime}–{shift.endTime}
-                              </span>
-                              <span>{shift.durationHours.toFixed(1)}h</span>
-                            </div>
-                            <div className="text-xs font-semibold text-slate-900 truncate">
-                              {shift.title}
-                            </div>
-                            <div className="text-[11px] text-slate-600 truncate">
-                              {shift.assignedName || 'Unassigned'} · {shift.department}
+                            <div className="space-y-1 min-w-0">
+                              <div className="flex items-center justify-between gap-1 text-[11px] font-mono tabular-nums text-slate-600">
+                                <span>
+                                  {shift.startTime}–{shift.endTime}
+                                </span>
+                                <span>{shift.durationHours.toFixed(1)}h</span>
+                              </div>
+                              <div className="text-xs font-semibold text-slate-900 truncate">
+                                {shift.title}
+                              </div>
+                              <div className="text-[11px] text-slate-600 truncate">
+                                {shift.assignedName || 'Unassigned'} · {shift.department}
+                              </div>
                             </div>
                             <div className="text-[11px]">{renderStatusText(shift)}</div>
                           </button>
@@ -377,7 +626,7 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
               const dateObj = parseIsoDateLocal(dateIso);
               const inCurrentMonth = dateObj.getMonth() === anchorDate.getMonth();
               const isToday = dateIso === todayIso;
-              const dayShifts = shiftsByDate.get(dateIso) || [];
+              const blocks = buildDayTimelineBlocks(dateIso);
 
               return (
                 <div
@@ -398,15 +647,37 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
                     >
                       {dateObj.getDate()}
                     </span>
-                    {dayShifts.length > 0 && (
+                    {blocks.length > 0 && (
                       <span className="text-[10px] font-mono tabular-nums text-slate-400">
-                        {dayShifts.length}
+                        {blocks.length}
                       </span>
                     )}
                   </div>
 
                   <div className="space-y-1">
-                    {dayShifts.slice(0, 3).map((shift) => {
+                    {blocks.slice(0, 3).map((block) => {
+                      if (block.kind === 'virtual_open') {
+                        return (
+                          <button
+                            key={block.key}
+                            type="button"
+                            onClick={() => {
+                              if (onQuickSelectOpenWindow) {
+                                onQuickSelectOpenWindow({
+                                  date: block.date,
+                                  startTime: block.startTime,
+                                  endTime: block.endTime,
+                                });
+                              }
+                            }}
+                            className="w-full text-left px-1.5 py-1 rounded text-[11px] truncate border bg-slate-50 border-dashed border-slate-300 text-slate-600 cursor-pointer"
+                          >
+                            <span className="font-mono tabular-nums">{block.startTime}</span> Open
+                          </button>
+                        );
+                      }
+
+                      const shift = block.shift;
                       const isOpen = shift.status === 'open' || !shift.assignedUid;
                       return (
                         <button
@@ -428,7 +699,7 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
                         </button>
                       );
                     })}
-                    {dayShifts.length > 3 && (
+                    {blocks.length > 3 && (
                       <button
                         type="button"
                         onClick={() => {
@@ -437,7 +708,7 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
                         }}
                         className="text-[10px] font-medium text-blue-700 hover:underline px-1 cursor-pointer"
                       >
-                        +{dayShifts.length - 3} more
+                        +{blocks.length - 3} more
                       </button>
                     )}
                   </div>
@@ -494,56 +765,57 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
             </div>
 
             {/* Submit / Withdraw for Open Blank Shifts */}
-            {(inspectedShift.status === 'open' || !inspectedShift.assignedUid) && (() => {
-              const mySub = getMyMatchingSubmission(inspectedShift);
-              const isBusy = submittingShiftId === inspectedShift.id;
-              return (
-                <div className="p-3.5 bg-blue-50/50 border border-blue-200 rounded-lg flex items-center justify-between gap-3">
-                  <div className="text-xs text-slate-700">
+            {(inspectedShift.status === 'open' || !inspectedShift.assignedUid) &&
+              (() => {
+                const mySub = getMyMatchingSubmission(inspectedShift);
+                const isBusy = submittingShiftId === inspectedShift.id;
+                return (
+                  <div className="p-3.5 bg-blue-50/50 border border-blue-200 rounded-lg flex items-center justify-between gap-3">
+                    <div className="text-xs text-slate-700">
+                      {mySub ? (
+                        <span>You submitted availability for this shift.</span>
+                      ) : (
+                        <span>This slot is open. Submit to become eligible for assignment.</span>
+                      )}
+                    </div>
                     {mySub ? (
-                      <span>You submitted availability for this shift.</span>
+                      <button
+                        type="button"
+                        disabled={isBusy}
+                        onClick={async () => {
+                          setSubmittingShiftId(inspectedShift.id);
+                          try {
+                            await onWithdrawSubmission(mySub.id);
+                          } finally {
+                            setSubmittingShiftId(null);
+                          }
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        <Check className="w-3.5 h-3.5 text-blue-700" />
+                        {isBusy ? 'Updating...' : 'Withdraw'}
+                      </button>
                     ) : (
-                      <span>This slot is open. Submit to become eligible for assignment.</span>
+                      <button
+                        type="button"
+                        disabled={isBusy}
+                        onClick={async () => {
+                          setSubmittingShiftId(inspectedShift.id);
+                          try {
+                            await onSubmitForShift(inspectedShift);
+                          } finally {
+                            setSubmittingShiftId(null);
+                          }
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-blue-700 rounded-lg hover:bg-blue-800 whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        <Hand className="w-3.5 h-3.5" />
+                        {isBusy ? 'Submitting...' : 'Submit for Shift'}
+                      </button>
                     )}
                   </div>
-                  {mySub ? (
-                    <button
-                      type="button"
-                      disabled={isBusy}
-                      onClick={async () => {
-                        setSubmittingShiftId(inspectedShift.id);
-                        try {
-                          await onWithdrawSubmission(mySub.id);
-                        } finally {
-                          setSubmittingShiftId(null);
-                        }
-                      }}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
-                    >
-                      <Check className="w-3.5 h-3.5 text-blue-700" />
-                      {isBusy ? 'Updating...' : 'Withdraw'}
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      disabled={isBusy}
-                      onClick={async () => {
-                        setSubmittingShiftId(inspectedShift.id);
-                        try {
-                          await onSubmitForShift(inspectedShift);
-                        } finally {
-                          setSubmittingShiftId(null);
-                        }
-                      }}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-blue-700 rounded-lg hover:bg-blue-800 whitespace-nowrap shrink-0 cursor-pointer"
-                    >
-                      <Hand className="w-3.5 h-3.5" />
-                      {isBusy ? 'Submitting...' : 'Submit for Shift'}
-                    </button>
-                  )}
-                </div>
-              );
-            })()}
+                );
+              })()}
 
             {/* Calendar Export Options */}
             <div className="space-y-2">
@@ -609,20 +881,22 @@ export const ShiftCalendarView: React.FC<ShiftCalendarViewProps> = ({
                 <div />
               )}
 
-              {inspectedShift.status !== 'completed' && inspectedShift.status !== 'open' && Boolean(inspectedShift.assignedUid) && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    const target = inspectedShift;
-                    setInspectedShift(null);
-                    onRequestChange(target);
-                  }}
-                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
-                >
-                  <ArrowRightLeft className="w-3.5 h-3.5" />
-                  Request Change
-                </button>
-              )}
+              {inspectedShift.status !== 'completed' &&
+                inspectedShift.status !== 'open' &&
+                Boolean(inspectedShift.assignedUid) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const target = inspectedShift;
+                      setInspectedShift(null);
+                      onRequestChange(target);
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+                  >
+                    <ArrowRightLeft className="w-3.5 h-3.5" />
+                    Request Change
+                  </button>
+                )}
             </div>
           </div>
         </div>

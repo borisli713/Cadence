@@ -8,9 +8,10 @@ import {
 } from '../types';
 import {
   acceptAllPendingChanges,
+  reconcileDayOpenSlotsInFirestore,
   reviewSingleScheduleChange,
 } from '../services/firestoreService';
-import { buildStaffFairnessMetrics } from '../utils/fairness';
+import { buildStaffFairnessMetrics, computeDurationHours } from '../utils/fairness';
 
 interface ManagerApprovalsViewProps {
   profile: UserProfile;
@@ -64,6 +65,37 @@ export const ManagerApprovalsView: React.FC<ManagerApprovalsViewProps> = ({
         reviewNotes[change.id] || '',
         shifts
       );
+      if (decision === 'approved') {
+        const simulatedShifts = shifts.map((s) => {
+          if (s.id !== change.shiftId) return s;
+          const nextAssignedUid = change.proposedAssigneeUid || s.assignedUid;
+          const nextAssignedName = change.proposedAssigneeName || s.assignedName;
+          return {
+            ...s,
+            date: change.proposedDate,
+            startTime: change.proposedStartTime,
+            endTime: change.proposedEndTime,
+            durationHours: computeDurationHours(
+              change.proposedStartTime,
+              change.proposedEndTime,
+              0
+            ),
+            assignedUid: nextAssignedUid,
+            assignedName: nextAssignedName,
+            status: 'scheduled' as const,
+          };
+        });
+        const datesToSync = Array.from(
+          new Set([change.currentDate, change.proposedDate].filter(Boolean))
+        );
+        for (const date of datesToSync) {
+          await reconcileDayOpenSlotsInFirestore(
+            date,
+            simulatedShifts.filter((s) => s.date === date),
+            profile.uid
+          );
+        }
+      }
       onNotifyBanner(
         decision === 'approved'
           ? `Approved ${change.requesterName}'s ${change.type.replace('_', ' ')} and pushed notification.`
@@ -83,6 +115,39 @@ export const ManagerApprovalsView: React.FC<ManagerApprovalsViewProps> = ({
         shifts,
         profile
       );
+      const changeByShiftId = new Map(pendingRequests.map((c) => [c.shiftId, c]));
+      const simulatedShifts = shifts.map((s) => {
+        const change = changeByShiftId.get(s.id);
+        if (!change) return s;
+        const nextAssignedUid = change.proposedAssigneeUid || s.assignedUid;
+        const nextAssignedName = change.proposedAssigneeName || s.assignedName;
+        return {
+          ...s,
+          date: change.proposedDate,
+          startTime: change.proposedStartTime,
+          endTime: change.proposedEndTime,
+          durationHours: computeDurationHours(
+            change.proposedStartTime,
+            change.proposedEndTime,
+            0
+          ),
+          assignedUid: nextAssignedUid,
+          assignedName: nextAssignedName,
+          status: 'scheduled' as const,
+        };
+      });
+      const datesToSync = Array.from(
+        new Set(
+          pendingRequests.flatMap((c) => [c.currentDate, c.proposedDate]).filter(Boolean)
+        )
+      );
+      for (const date of datesToSync) {
+        await reconcileDayOpenSlotsInFirestore(
+          date,
+          simulatedShifts.filter((s) => s.date === date),
+          profile.uid
+        );
+      }
       onNotifyBanner(
         `Accepted all ${approvedCount} schedule change request(s) in one go and pushed status alerts to staff.`
       );

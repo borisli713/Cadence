@@ -28,8 +28,10 @@ import {
   UserRole,
 } from '../types';
 import {
+  buildWeekReconciliationPlan,
   computeDurationHours,
   GeneratedWeeklyShiftDraft,
+  partitionDayTimeline,
 } from '../utils/fairness';
 
 export function makeSafeId(prefix: string): string {
@@ -1265,15 +1267,22 @@ export async function commitWeeklyScheduleBatch(
   drafts: GeneratedWeeklyShiftDraft[],
   weekStartDate: string,
   staffDirectory: StaffDirectoryEntry[],
-  manager: UserProfile
-): Promise<{ totalCreated: number; assignedCount: number; openCount: number }> {
-  if (drafts.length === 0) return { totalCreated: 0, assignedCount: 0, openCount: 0 };
+  manager: UserProfile,
+  staleOpenShiftIds: string[] = []
+): Promise<{ totalCreated: number; assignedCount: number; openCount: number; cleanedCount: number }> {
+  if (drafts.length === 0 && staleOpenShiftIds.length === 0) {
+    return { totalCreated: 0, assignedCount: 0, openCount: 0, cleanedCount: 0 };
+  }
 
   const batch = writeBatch(db);
   const hoursByUid = new Map<string, { count: number; hours: number; firstShiftId: string }>();
   const nowIso = new Date().toISOString().slice(0, 19);
   let assignedCount = 0;
   let openCount = 0;
+
+  for (const staleId of staleOpenShiftIds) {
+    batch.delete(doc(db, 'shifts', staleId));
+  }
 
   for (let i = 0; i < drafts.length; i++) {
     const d = drafts[i];
@@ -1348,7 +1357,112 @@ export async function commitWeeklyScheduleBatch(
     totalCreated: drafts.length,
     assignedCount,
     openCount,
+    cleanedCount: staleOpenShiftIds.length,
   };
+}
+
+export async function syncNonOverlappingWeekInFirestore(
+  weekDates: string[],
+  existingShifts: Shift[],
+  manager: UserProfile
+): Promise<{ removed: number; created: number }> {
+  const plan = buildWeekReconciliationPlan({
+    weekDates,
+    existingShifts,
+  });
+
+  if (plan.staleOpenShiftIds.length === 0 && plan.missingOpenDrafts.length === 0) {
+    return { removed: 0, created: 0 };
+  }
+
+  const batch = writeBatch(db);
+  for (const id of plan.staleOpenShiftIds) {
+    batch.delete(doc(db, 'shifts', id));
+  }
+
+  plan.missingOpenDrafts.forEach((d, idx) => {
+    const shiftId = makeSafeId(`gap${idx}`);
+    batch.set(doc(db, 'shifts', shiftId), {
+      id: shiftId,
+      title: d.title.trim().slice(0, 120),
+      department: d.department.trim().slice(0, 60),
+      date: d.date,
+      startTime: d.startTime,
+      endTime: d.endTime,
+      durationHours: d.durationHours,
+      assignedUid: '',
+      assignedName: '',
+      candidateUids: [],
+      status: 'open',
+      visibility: 'team',
+      fairnessNote: d.fairnessNote.slice(0, 300),
+      createdBy: manager.uid,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  });
+
+  try {
+    await batch.commit();
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, 'shifts/syncNonOverlapping');
+  }
+
+  return {
+    removed: plan.staleOpenShiftIds.length,
+    created: plan.missingOpenDrafts.length,
+  };
+}
+
+export async function reconcileDayOpenSlotsInFirestore(
+  date: string,
+  simulatedDayShifts: Shift[],
+  managerUid: string
+): Promise<void> {
+  const partition = partitionDayTimeline(date, simulatedDayShifts);
+  const missingGaps = partition.openGaps.filter(
+    (gap) => !partition.matchingOpenShifts.has(`${gap.startTime}-${gap.endTime}`)
+  );
+
+  if (partition.staleOpenShiftIds.length === 0 && missingGaps.length === 0) {
+    return;
+  }
+
+  const batch = writeBatch(db);
+  for (const staleId of partition.staleOpenShiftIds) {
+    batch.delete(doc(db, 'shifts', staleId));
+  }
+
+  missingGaps.forEach((gap, idx) => {
+    const shiftId = makeSafeId(`gap${idx}`);
+    const isFullDay = partition.assignedShifts.length === 0;
+    batch.set(doc(db, 'shifts', shiftId), {
+      id: shiftId,
+      title: isFullDay ? 'Full Day Coverage (Open)' : 'Open Shift Coverage',
+      department: 'Operations',
+      date,
+      startTime: gap.startTime,
+      endTime: gap.endTime,
+      durationHours: gap.durationHours,
+      assignedUid: '',
+      assignedName: '',
+      candidateUids: [],
+      status: 'open',
+      visibility: 'team',
+      fairnessNote: isFullDay
+        ? 'Full-day open column — no staff assigned yet.'
+        : 'Non-overlapping open shift gap.',
+      createdBy: managerUid,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  });
+
+  try {
+    await batch.commit();
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, `shifts/reconcile/${date}`);
+  }
 }
 
 export async function updateShiftManually(

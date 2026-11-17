@@ -8,6 +8,7 @@ import {
   CheckCheck,
   ClipboardList,
   ExternalLink,
+  History,
   LayoutDashboard,
   LogOut,
   Menu,
@@ -44,6 +45,8 @@ import { ManagerApprovalsView } from './components/ManagerApprovalsView';
 import { NotificationsView } from './components/NotificationsView';
 import { TeamHoursView } from './components/TeamHoursView';
 import { TimeOffRequestsView } from './components/TimeOffRequestsView';
+import { ShiftHistoryView } from './components/ShiftHistoryView';
+import { getTimestampMillis } from './utils/timestamps';
 
 type NavTab =
   | 'overview'
@@ -51,6 +54,7 @@ type NavTab =
   | 'reports'
   | 'approvals'
   | 'timeoff'
+  | 'history'
   | 'notifications'
   | 'team';
 
@@ -60,6 +64,7 @@ const TAB_LABELS: Record<NavTab, string> = {
   reports: 'Shift Reports',
   approvals: 'Approvals',
   timeoff: 'Time Off Requests',
+  history: 'Shift History',
   notifications: 'Notifications',
   team: 'Team & Hours',
 };
@@ -177,23 +182,61 @@ function WorkspaceApp() {
       (err) => handleFirestoreError(err, OperationType.LIST, 'shifts')
     );
 
-    const changesQuery = isManager
-      ? collection(db, 'scheduleChanges')
-      : query(collection(db, 'scheduleChanges'), where('requesterUid', '==', profile.uid));
+    const sortScheduleChanges = (items: ScheduleChangeRequest[]) => {
+      items.sort((a, b) => {
+        if (a.status === 'pending' && b.status !== 'pending') return -1;
+        if (a.status !== 'pending' && b.status === 'pending') return 1;
+        const aTime = getTimestampMillis(a.updatedAt) || getTimestampMillis(a.createdAt);
+        const bTime = getTimestampMillis(b.updatedAt) || getTimestampMillis(b.createdAt);
+        if (bTime !== aTime) return bTime - aTime;
+        return b.id.localeCompare(a.id);
+      });
+      return items;
+    };
 
-    const unsubChanges = onSnapshot(
-      changesQuery,
-      (snap) => {
-        const items = snap.docs.map((d) => d.data() as ScheduleChangeRequest);
-        items.sort((a, b) => {
-          if (a.status === 'pending' && b.status !== 'pending') return -1;
-          if (a.status !== 'pending' && b.status === 'pending') return 1;
-          return b.id.localeCompare(a.id);
-        });
-        setScheduleChanges(items);
-      },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'scheduleChanges')
-    );
+    let unsubChanges: () => void;
+    if (isManager) {
+      unsubChanges = onSnapshot(
+        collection(db, 'scheduleChanges'),
+        (snap) => {
+          const items = snap.docs.map((d) => d.data() as ScheduleChangeRequest);
+          setScheduleChanges(sortScheduleChanges(items));
+        },
+        (err) => handleFirestoreError(err, OperationType.LIST, 'scheduleChanges')
+      );
+    } else {
+      let ownReqItems: ScheduleChangeRequest[] = [];
+      let assignedItems: ScheduleChangeRequest[] = [];
+      const mergeAndSet = () => {
+        const byId = new Map<string, ScheduleChangeRequest>();
+        ownReqItems.forEach((item) => byId.set(item.id, item));
+        assignedItems.forEach((item) => byId.set(item.id, item));
+        setScheduleChanges(sortScheduleChanges(Array.from(byId.values())));
+      };
+
+      const unsubOwn = onSnapshot(
+        query(collection(db, 'scheduleChanges'), where('requesterUid', '==', profile.uid)),
+        (snap) => {
+          ownReqItems = snap.docs.map((d) => d.data() as ScheduleChangeRequest);
+          mergeAndSet();
+        },
+        (err) => handleFirestoreError(err, OperationType.LIST, 'scheduleChanges')
+      );
+
+      const unsubProposed = onSnapshot(
+        query(collection(db, 'scheduleChanges'), where('proposedAssigneeUid', '==', profile.uid)),
+        (snap) => {
+          assignedItems = snap.docs.map((d) => d.data() as ScheduleChangeRequest);
+          mergeAndSet();
+        },
+        (err) => handleFirestoreError(err, OperationType.LIST, 'scheduleChanges')
+      );
+
+      unsubChanges = () => {
+        unsubOwn();
+        unsubProposed();
+      };
+    }
 
     const reportsQuery = isManager
       ? collection(db, 'shiftReports')
@@ -370,6 +413,7 @@ function WorkspaceApp() {
       icon: <CalendarOff className="w-4 h-4" />,
       badge: pendingTimeOffCount > 0 ? pendingTimeOffCount : undefined,
     },
+    { key: 'history', label: 'Shift History', icon: <History className="w-4 h-4" /> },
     {
       key: 'notifications',
       label: 'Notifications',
@@ -590,6 +634,15 @@ function WorkspaceApp() {
           {activeTab === 'timeoff' && (
             <TimeOffRequestsView
               profile={profile}
+              timeOffRequests={timeOffRequests}
+              onNotifyBanner={showBanner}
+            />
+          )}
+
+          {activeTab === 'history' && (
+            <ShiftHistoryView
+              profile={profile}
+              scheduleChanges={scheduleChanges}
               timeOffRequests={timeOffRequests}
               onNotifyBanner={showBanner}
             />

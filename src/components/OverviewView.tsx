@@ -26,7 +26,7 @@ interface OverviewViewProps {
   shiftReports: ShiftReport[];
   notifications: PushNotificationRecord[];
   staffDirectory: StaffDirectoryEntry[];
-  onNavigate: (tab: 'overview' | 'schedule' | 'reports' | 'approvals' | 'timeoff' | 'notifications' | 'team') => void;
+  onNavigate: (tab: 'overview' | 'schedule' | 'reports' | 'approvals' | 'timeoff' | 'history' | 'notifications' | 'team') => void;
   onOpenNewReport: () => void;
 }
 

@@ -12,10 +12,12 @@ import {
 import {
   CheckCircle2,
   Clock,
+  ExternalLink,
   LogOut,
   Mail,
   RefreshCw,
   ShieldCheck,
+  Smartphone,
 } from 'lucide-react';
 import { auth, googleProvider } from '../firebase';
 
@@ -236,6 +238,22 @@ export const AuthGate: React.FC<AuthGateProps> = ({
             </button>
           </div>
         </div>
+
+        <div className="max-w-md w-full mx-auto mt-4 bg-white border border-slate-200 rounded-xl px-5 py-3.5 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 text-xs text-slate-600 min-w-0">
+            <Smartphone className="w-4 h-4 text-slate-500 shrink-0" />
+            <span className="truncate">Mobile apps are available as well.</span>
+          </div>
+          <a
+            href="https://borisli713.github.io/Cadence-Mobile/"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-900 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0"
+          >
+            <span>Get Mobile App</span>
+            <ExternalLink className="w-3.5 h-3.5" />
+          </a>
+        </div>
       </div>
     );
   }
@@ -437,6 +455,24 @@ export const AuthGate: React.FC<AuthGateProps> = ({
             Sign in with Google
           </button>
         </div>
+      </div>
+
+      <div className="max-w-4xl w-full mx-auto mt-4 bg-white border border-slate-200 rounded-xl px-6 py-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div className="flex items-center gap-2.5 text-xs text-slate-600">
+          <Smartphone className="w-4 h-4 text-slate-500 shrink-0" />
+          <span>
+            Mobile apps are available as well — access your schedule and alerts from your phone.
+          </span>
+        </div>
+        <a
+          href="https://borisli713.github.io/Cadence-Mobile/"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-medium text-slate-900 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0"
+        >
+          <span>Get Mobile App</span>
+          <ExternalLink className="w-3.5 h-3.5" />
+        </a>
       </div>
     </div>
   );

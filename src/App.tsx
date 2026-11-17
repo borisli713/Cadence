@@ -7,10 +7,12 @@ import {
   CalendarOff,
   CheckCheck,
   ClipboardList,
+  ExternalLink,
   LayoutDashboard,
   LogOut,
   Menu,
   Settings,
+  Smartphone,
   Users,
   X,
 } from 'lucide-react';
@@ -612,6 +614,26 @@ function WorkspaceApp() {
             />
           )}
         </main>
+
+        <footer className="border-t border-slate-200 bg-white px-6 lg:px-8 py-4">
+          <div className="max-w-7xl mx-auto flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-xs text-slate-600">
+              <Smartphone className="w-4 h-4 text-slate-500 shrink-0" />
+              <span>
+                Mobile apps are available as well — sync your shifts, approvals, and alerts across devices.
+              </span>
+            </div>
+            <a
+              href="https://borisli713.github.io/Cadence-Mobile/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
+            >
+              <span>Get Mobile App</span>
+              <ExternalLink className="w-3.5 h-3.5" />
+            </a>
+          </div>
+        </footer>
       </div>
 
       {/* Profile Preferences Modal */}

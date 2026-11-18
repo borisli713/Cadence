@@ -3,6 +3,7 @@ import { onAuthStateChanged, signOut, User } from 'firebase/auth';
 import { collection, onSnapshot, query, where } from 'firebase/firestore';
 import {
   Bell,
+  CalendarCheck2,
   CalendarClock,
   CalendarOff,
   CheckCheck,
@@ -46,10 +47,13 @@ import { NotificationsView } from './components/NotificationsView';
 import { TeamHoursView } from './components/TeamHoursView';
 import { TimeOffRequestsView } from './components/TimeOffRequestsView';
 import { ShiftHistoryView } from './components/ShiftHistoryView';
+import { MyScheduleView } from './components/MyScheduleView';
+import { formatIsoDateLocal } from './utils/calendarExport';
 import { getTimestampMillis } from './utils/timestamps';
 
 type NavTab =
   | 'overview'
+  | 'my_schedule'
   | 'schedule'
   | 'reports'
   | 'approvals'
@@ -60,6 +64,7 @@ type NavTab =
 
 const TAB_LABELS: Record<NavTab, string> = {
   overview: 'Overview',
+  my_schedule: 'My Schedule',
   schedule: 'Schedule & Fairness',
   reports: 'Shift Reports',
   approvals: 'Approvals',
@@ -172,15 +177,44 @@ function WorkspaceApp() {
       (err) => handleFirestoreError(err, OperationType.LIST, 'staffDirectory')
     );
 
-    const unsubShifts = onSnapshot(
+    let teamShiftsList: Shift[] = [];
+    let myAssignedList: Shift[] = [];
+    const mergeAndSetShifts = () => {
+      const byId = new Map<string, Shift>();
+      teamShiftsList.forEach((s) => byId.set(s.id, s));
+      myAssignedList.forEach((s) => {
+        const existing = byId.get(s.id);
+        if (!existing || getTimestampMillis(s.updatedAt) >= getTimestampMillis(existing.updatedAt)) {
+          byId.set(s.id, s);
+        }
+      });
+      const merged = Array.from(byId.values());
+      merged.sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
+      setShifts(merged);
+    };
+
+    const unsubTeamShifts = onSnapshot(
       query(collection(db, 'shifts'), where('visibility', '==', 'team')),
       (snap) => {
-        const items = snap.docs.map((d) => d.data() as Shift);
-        items.sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
-        setShifts(items);
+        teamShiftsList = snap.docs.map((d) => d.data() as Shift);
+        mergeAndSetShifts();
       },
       (err) => handleFirestoreError(err, OperationType.LIST, 'shifts')
     );
+
+    const unsubMyAssignedShifts = onSnapshot(
+      query(collection(db, 'shifts'), where('assignedUid', '==', profile.uid)),
+      (snap) => {
+        myAssignedList = snap.docs.map((d) => d.data() as Shift);
+        mergeAndSetShifts();
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'shifts/assigned')
+    );
+
+    const unsubShifts = () => {
+      unsubTeamShifts();
+      unsubMyAssignedShifts();
+    };
 
     const sortScheduleChanges = (items: ScheduleChangeRequest[]) => {
       items.sort((a, b) => {
@@ -378,6 +412,18 @@ function WorkspaceApp() {
     [notifications, profile?.uid]
   );
 
+  const myUpcomingAssignedCount = useMemo(() => {
+    if (!profile) return 0;
+    const today = formatIsoDateLocal(new Date());
+    return shifts.filter(
+      (s) =>
+        s.assignedUid === profile.uid &&
+        s.status !== 'open' &&
+        s.status !== 'completed' &&
+        s.date >= today
+    ).length;
+  }, [shifts, profile]);
+
   if (!authReady || loadingProfile) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
@@ -399,6 +445,12 @@ function WorkspaceApp() {
 
   const navItems: { key: NavTab; label: string; icon: React.ReactNode; badge?: number }[] = [
     { key: 'overview', label: 'Overview', icon: <LayoutDashboard className="w-4 h-4" /> },
+    {
+      key: 'my_schedule',
+      label: 'My Schedule',
+      icon: <CalendarCheck2 className="w-4 h-4" />,
+      badge: myUpcomingAssignedCount > 0 ? myUpcomingAssignedCount : undefined,
+    },
     { key: 'schedule', label: 'Schedule & Fairness', icon: <CalendarClock className="w-4 h-4" /> },
     { key: 'reports', label: 'Shift Reports', icon: <ClipboardList className="w-4 h-4" /> },
     {
@@ -595,6 +647,20 @@ function WorkspaceApp() {
                 setOpenReportModalFromOverview(true);
                 setActiveTab('reports');
               }}
+            />
+          )}
+
+          {activeTab === 'my_schedule' && (
+            <MyScheduleView
+              profile={profile}
+              assignedShifts={shifts}
+              staffDirectory={staffDirectory}
+              onOpenShiftReports={() => {
+                setOpenReportModalFromOverview(true);
+                setActiveTab('reports');
+              }}
+              onOpenTeamSchedule={() => setActiveTab('schedule')}
+              onNotifyBanner={showBanner}
             />
           )}
 

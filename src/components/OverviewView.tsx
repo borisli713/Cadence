@@ -26,7 +26,7 @@ interface OverviewViewProps {
   shiftReports: ShiftReport[];
   notifications: PushNotificationRecord[];
   staffDirectory: StaffDirectoryEntry[];
-  onNavigate: (tab: 'overview' | 'schedule' | 'reports' | 'approvals' | 'timeoff' | 'history' | 'notifications' | 'team') => void;
+  onNavigate: (tab: 'overview' | 'my_schedule' | 'schedule' | 'reports' | 'approvals' | 'timeoff' | 'history' | 'notifications' | 'team') => void;
   onOpenNewReport: () => void;
 }
 
@@ -93,6 +93,14 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
           <div className="text-xs text-slate-500 tabular-nums">
             {myWorkedHours.toFixed(1)}h worked · {myScheduledHours.toFixed(1)}h upcoming · Target {profile.weeklyHoursTarget}h
           </div>
+          <button
+            type="button"
+            onClick={() => onNavigate('my_schedule')}
+            className="text-xs font-medium text-blue-700 hover:underline inline-flex items-center gap-1 cursor-pointer"
+          >
+            View my assigned schedule
+            <ArrowRight className="w-3 h-3" />
+          </button>
         </div>
 
         <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-2">
